@@ -1,10 +1,12 @@
 // src/app.module.ts
 import { Module } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TerminusModule } from '@nestjs/terminus';
 import { HealthModule } from './health/health.module';
 import { MinioModule } from './minio/minio.module';
 import { UploadModule } from './upload/upload.module';
+import { FilesModule } from './files/files.module';
+import { MongooseModule } from '@nestjs/mongoose';
 
 @Module({
   imports: [
@@ -12,8 +14,16 @@ import { UploadModule } from './upload/upload.module';
       isGlobal: true,          // ↓ zpřístupní ConfigService všude (i v main.ts)
       envFilePath: ['.env'],   // volitelné; cesta k env souboru
     }),
+    MongooseModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (cfg: ConfigService) => ({
+        uri: cfg.get<string>('MONGO_URI') ?? 'mongodb://localhost:27017/donkey-learn',
+      }),
+    }),
+
     MinioModule, // klient na MinIO
-    UploadModule, // upload endpoint
+    // UploadModule, // upload endpoint
+    FilesModule,
     TerminusModule,
     HealthModule,
   ],
