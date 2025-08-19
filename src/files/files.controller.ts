@@ -1,13 +1,14 @@
 import {
     Controller, Get, Query, Param, Delete, Post, UploadedFile, UseInterceptors,
-    Body, BadRequestException, UseGuards
+    Body, BadRequestException, UseGuards, HttpCode
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { CreateFileDto } from './dto/create-file.dto';
-import { MinioService } from '../minio/minio.service';
-import { randomUUID } from 'crypto';
 import { ApiTags, ApiConsumes, ApiBody, ApiQuery, ApiBearerAuth } from '@nestjs/swagger';
+import { randomUUID } from 'crypto';
+
 import { FilesService } from './files.service';
+import { MinioService } from '../minio/minio.service';
+import { CreateFileDto } from './dto/create-file.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 
@@ -32,23 +33,27 @@ export class FilesController {
         @CurrentUser() user: { userId: string; roles: string[] },
     ) {
         const filter = q ? { originalName: { $regex: q, $options: 'i' } } : {};
-        return this.files.findAllForUser(user, filter, Number(limit), Number(skip));
+        return await this.files.findAllForUser(user, filter, Number(limit), Number(skip));
     }
 
     @Get(':id')
     async getOne(@Param('id') id: string, @CurrentUser() user: any) {
-        return this.files.findByIdForUser(id, user);
+        return await this.files.findByIdForUser(id, user);
     }
 
     @Get(':id/download')
-    async download(@Param('id') id: string, @CurrentUser() user: any) {
-        const url = await this.files.getDownloadUrlForUser(id, user);
+    async download(
+        @Param('id') id: string,
+        @CurrentUser() user: any,
+        @Query('expiresSec') expiresSec = 3600,
+    ) {
+        const url = await this.files.getDownloadUrlForUser(id, user, Number(expiresSec));
         return { url };
     }
 
     @Delete(':id')
     async delete(@Param('id') id: string, @CurrentUser() user: any) {
-        return this.files.removeForUser(id, user);
+        return await this.files.removeForUser(id, user);
     }
 
     @Post('upload')
@@ -77,7 +82,7 @@ export class FilesController {
 
         await this.minio.uploadObject(objectName, file.buffer, file.mimetype);
 
-        const doc = await this.files.create({
+        const created = await this.files.create({
             originalName: file.originalname,
             key: objectName,
             bucket: this.minio.bucketName(),
@@ -87,11 +92,15 @@ export class FilesController {
             uploaderId: user?.userId,
         });
 
+        // robustní převod na plain object
+        const plain = created && typeof (created as any).toObject === 'function'
+            ? (created as any).toObject()
+            : created;
+
         const url = await this.minio.getPresignedUrl(objectName);
-        return { ...doc.toObject?.() ?? doc, url };
+        return { ...plain, url };
     }
 
-    // --- Chunkování zabezpečeně ---
     @Post(':id/parse')
     async parse(
         @Param('id') id: string,
@@ -100,11 +109,11 @@ export class FilesController {
         @CurrentUser() user?: { userId: string; roles: string[] },
     ) {
         const res = await this.files.parseAndChunkForUser(id, user!, Number(size), Number(overlap));
-        return { ok: true, ...res };
+        return { ok: true, ...res }; // ✅ šíříme chunksInserted & pageCount
     }
 
     @Get(':id/chunks')
     async chunks(@Param('id') id: string, @CurrentUser() user?: { userId: string; roles: string[] }) {
-        return this.files.listChunksForUser(id, user!);
+        return await this.files.listChunksForUser(id, user!);
     }
 }
