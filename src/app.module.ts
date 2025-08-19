@@ -7,6 +7,7 @@ import { MinioModule } from './minio/minio.module';
 import { UploadModule } from './upload/upload.module';
 import { FilesModule } from './files/files.module';
 import { MongooseModule } from '@nestjs/mongoose';
+import { AuthModule } from './auth/auth.module';
 
 @Module({
   imports: [
@@ -23,6 +24,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 
     MinioModule, // klient na MinIO
     // UploadModule, // upload endpoint
+    AuthModule,
     FilesModule,
     TerminusModule,
     HealthModule,

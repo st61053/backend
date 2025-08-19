@@ -12,8 +12,9 @@ async function bootstrap() {
 
   const config = new DocumentBuilder()
     .setTitle('Donkey learn API')
-    .setDescription('Upload, list, download (presigned), delete')
+    .setDescription('API for Donkey learn application')
     .setVersion('1.0.0')
+    .addBearerAuth()
     .build();
   const document = SwaggerModule.createDocument(app, config);
   SwaggerModule.setup('/docs', app, document);

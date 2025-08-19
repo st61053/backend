@@ -1,12 +1,14 @@
-// src/files/files.service.ts
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, FilterQuery } from 'mongoose';
-import { DocumentStatus, StoredFile } from './schemas/file.schema';
+import { StoredFile } from './schemas/file.schema';
 import { MinioService } from '../minio/minio.service';
+import { PdfTextExtractor } from '../parsing/pdf-text-extractor.service';
+import { TextChunker } from '../parsing/text-chunker.service';
+import { DocumentStatus } from './schemas/file.schema';
 import { Chunk } from './schemas/chunk.schema';
-import { PdfTextExtractor } from 'src/parsing/pdf-text-extractor.service';
-import { TextChunker } from 'src/parsing/text-chunker.service';
+
+type UserCtx = { userId: string; roles?: string[] };
 
 @Injectable()
 export class FilesService {
@@ -18,62 +20,78 @@ export class FilesService {
         private readonly chunker: TextChunker,
     ) { }
 
+    // --- helper pro práva ---
+    private isAdmin(user?: UserCtx) {
+        return !!user?.roles?.includes('ADMIN');
+    }
+    private ensureOwnerOrAdmin(ownerId: string | undefined | null, user: UserCtx) {
+        if (ownerId && ownerId.toString() === user.userId) return;
+        if (this.isAdmin(user)) return;
+        throw new ForbiddenException('Not allowed');
+    }
+
+    // --- CRUD nad StoredFile ---
     async create(meta: {
-        originalName: string;
-        key: string;
-        bucket: string;
-        mime: string;
-        size: number;
-        uploaderId?: string;
-        tags?: string[];
+        originalName: string; key: string; bucket: string; mime: string; size: number;
+        uploaderId?: string; tags?: string[];
     }) {
         return this.fileModel.create(meta);
     }
 
-    async findAll(filter: FilterQuery<StoredFile> = {}, limit = 50, skip = 0) {
-        return this.fileModel.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean();
+    async findAllForUser(user: UserCtx, filter: FilterQuery<StoredFile> = {}, limit = 50, skip = 0) {
+        const f = { ...filter };
+        if (!this.isAdmin(user)) (f as any).uploaderId = user.userId;
+        return this.fileModel.find(f).sort({ createdAt: -1 }).skip(skip).limit(limit).lean();
     }
 
-    async findById(id: string) {
+    async findByIdForUser(id: string, user: UserCtx) {
         const doc = await this.fileModel.findById(id).lean();
         if (!doc) throw new NotFoundException('File not found');
+        this.ensureOwnerOrAdmin(doc.uploaderId, user);
         return doc;
     }
 
-    async getDownloadUrl(id: string, expiresSec = 3600) {
-        const doc = await this.findById(id);
+    async getDownloadUrlForUser(id: string, user: UserCtx, expiresSec = 3600) {
+        const doc = await this.findByIdForUser(id, user);
         return this.minio.getPresignedUrl(doc.key, expiresSec);
     }
 
-    async remove(id: string) {
+    async removeForUser(id: string, user: UserCtx) {
         const doc = await this.fileModel.findById(id);
         if (!doc) throw new NotFoundException('File not found');
-        // Smazat z MinIO (nepovinné — ale doporučené)
+        this.ensureOwnerOrAdmin(doc.uploaderId, user);
         await this.minio.removeObject(doc.key);
         await doc.deleteOne();
+        await this.chunkModel.deleteMany({ documentId: id }); // uklidit chunky
         return { ok: true };
     }
 
-    async listChunks(documentId: string) {
+    // --- Chunking & přístup k chunkům ---
+    async listChunksForUser(documentId: string, user: UserCtx) {
+        const doc = await this.fileModel.findById(documentId).lean();
+        if (!doc) throw new NotFoundException('File not found');
+        this.ensureOwnerOrAdmin(doc.uploaderId, user);
         return this.chunkModel.find({ documentId }).sort({ index: 1 }).lean();
     }
 
-    async parseAndChunk(documentId: string, size = 1000, overlap = 150) {
+    async parseAndChunkForUser(documentId: string, user: UserCtx, size = 1000, overlap = 150) {
         const doc = await this.fileModel.findById(documentId);
         if (!doc) throw new NotFoundException('File not found');
+        this.ensureOwnerOrAdmin(doc.uploaderId, user);
 
         try {
             const buf = await this.minio.getObjectBuffer(doc.key);
             const pages = await this.extractor.extractPerPage(buf);
             const prepared = this.chunker.split(doc.id, pages, size, overlap);
 
-            // idempotentně přegenerovat chunky
             await this.chunkModel.deleteMany({ documentId: doc.id });
             await this.chunkModel.insertMany(prepared);
 
             doc.status = DocumentStatus.PARSED;
-            doc.pageCount = pages.length;
+            (doc as any).pageCount = pages.length;
             await doc.save();
+
+            return { chunksInserted: prepared.length, pageCount: pages.length };
         } catch (e) {
             doc.status = DocumentStatus.FAILED;
             await doc.save();
