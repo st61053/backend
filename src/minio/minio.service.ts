@@ -55,4 +55,16 @@ export class MinioService {
     bucketName() {
         return this.bucket;
     }
+
+    // Pomocná metoda pro získání objektu jako Buffer
+    async getObjectBuffer(objectName: string): Promise<Buffer> {
+        const stream = await this.minio.getObject(this.bucket, objectName);
+        const parts: Buffer[] = [];
+        return new Promise((resolve, reject) => {
+            stream.on('data', (d) => parts.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+            stream.on('end', () => resolve(Buffer.concat(parts)));
+            stream.on('error', reject);
+        });
+    }
+
 }

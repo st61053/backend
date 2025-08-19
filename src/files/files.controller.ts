@@ -9,7 +9,7 @@ import { MinioService } from '../minio/minio.service';
 import { randomUUID } from 'crypto';
 import { ApiTags, ApiConsumes, ApiBody, ApiQuery } from '@nestjs/swagger';
 
-@ApiTags('files')
+@ApiTags('Files')
 @Controller('files')
 export class FilesController {
     constructor(
@@ -82,5 +82,20 @@ export class FilesController {
         const url = await this.minio.getPresignedUrl(objectName);
 
         return { ...doc.toObject?.() ?? doc, url };
+    }
+
+    @Post(':id/parse')
+    async parse(
+        @Param('id') id: string,
+        @Query('size') size = 1000,
+        @Query('overlap') overlap = 150,
+    ) {
+        await this.files.parseAndChunk(id, Number(size), Number(overlap));
+        return { ok: true };
+    }
+
+    @Get(':id/chunks')
+    async chunks(@Param('id') id: string) {
+        return this.files.listChunks(id);
     }
 }
