@@ -1,6 +1,6 @@
 import {
-    Controller, Get, Query, Param, Delete, Post, UploadedFile, UseInterceptors,
-    Body, BadRequestException, UseGuards, HttpCode
+    Body, Controller, Get, Query, Param, Delete, Post, UploadedFile, UseInterceptors,
+    BadRequestException, UseGuards, Patch
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiConsumes, ApiBody, ApiQuery, ApiBearerAuth } from '@nestjs/swagger';
@@ -12,27 +12,30 @@ import { CreateFileDto } from './dto/create-file.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 
+class MoveFileDto { folderId!: string; }
+
 @ApiTags('Files')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard)
 @Controller('files')
 export class FilesController {
-    constructor(
-        private readonly files: FilesService,
-        private readonly minio: MinioService,
-    ) { }
+    constructor(private readonly files: FilesService, private readonly minio: MinioService) { }
 
     @Get()
     @ApiQuery({ name: 'q', required: false, description: 'fulltext v názvu (simple contains)' })
+    @ApiQuery({ name: 'folderId', required: false, description: 'filtr na složku' }) // NEW
     @ApiQuery({ name: 'limit', required: false, schema: { type: 'number', default: 50 } })
     @ApiQuery({ name: 'skip', required: false, schema: { type: 'number', default: 0 } })
     async list(
         @Query('q') q: string | undefined,
+        @Query('folderId') folderId: string | undefined,
         @Query('limit') limit = 50,
         @Query('skip') skip = 0,
         @CurrentUser() user: { userId: string; roles: string[] },
     ) {
-        const filter = q ? { originalName: { $regex: q, $options: 'i' } } : {};
+        const filter: any = {};
+        if (q) filter.originalName = { $regex: q, $options: 'i' };
+        if (folderId) filter.folderId = folderId;
         return await this.files.findAllForUser(user, filter, Number(limit), Number(skip));
     }
 
@@ -42,11 +45,7 @@ export class FilesController {
     }
 
     @Get(':id/download')
-    async download(
-        @Param('id') id: string,
-        @CurrentUser() user: any,
-        @Query('expiresSec') expiresSec = 3600,
-    ) {
+    async download(@Param('id') id: string, @CurrentUser() user: any, @Query('expiresSec') expiresSec = 3600) {
         const url = await this.files.getDownloadUrlForUser(id, user, Number(expiresSec));
         return { url };
     }
@@ -65,9 +64,10 @@ export class FilesController {
             type: 'object',
             properties: {
                 file: { type: 'string', format: 'binary' },
+                folderId: { type: 'string', description: 'ID cílové složky' },
                 tags: { type: 'array', items: { type: 'string' } },
             },
-            required: ['file'],
+            required: ['file', 'folderId'],
         },
     })
     async upload(
@@ -89,16 +89,42 @@ export class FilesController {
             mime: file.mimetype,
             size: file.size,
             tags: body?.tags ?? [],
-            uploaderId: user?.userId,
+            uploaderId: user!.userId,
+            folderId: body!.folderId!,
         });
 
-        // robustní převod na plain object
         const plain = created && typeof (created as any).toObject === 'function'
             ? (created as any).toObject()
             : created;
 
+        const normalized = {
+            id: plain._id?.toString?.() ?? created.id,
+            originalName: plain.originalName,
+            key: plain.key,
+            bucket: plain.bucket,
+            mime: plain.mime,
+            size: plain.size,
+            uploaderId: plain.uploaderId,
+            folderId: plain.folderId?.toString?.() ?? plain.folderId,
+            tags: plain.tags ?? [],
+            status: plain.status,
+            pageCount: plain.pageCount,
+            createdAt: plain.createdAt,
+            updatedAt: plain.updatedAt,
+        };
+
         const url = await this.minio.getPresignedUrl(objectName);
-        return { ...plain, url };
+        return { ...normalized, url };
+    }
+
+    // NEW: přesun souboru do jiné složky
+    @Patch(':id/folder')
+    async move(
+        @Param('id') id: string,
+        @Body() body: MoveFileDto,
+        @CurrentUser() user: { userId: string; roles: string[] },
+    ) {
+        return this.files.moveToFolderForUser(id, body.folderId, user);
     }
 
     @Post(':id/parse')
@@ -109,7 +135,7 @@ export class FilesController {
         @CurrentUser() user?: { userId: string; roles: string[] },
     ) {
         const res = await this.files.parseAndChunkForUser(id, user!, Number(size), Number(overlap));
-        return { ok: true, ...res }; // ✅ šíříme chunksInserted & pageCount
+        return { ok: true, ...res };
     }
 
     @Get(':id/chunks')

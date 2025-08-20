@@ -1,12 +1,13 @@
-import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model, FilterQuery } from 'mongoose';
+import { Model, FilterQuery, Types } from 'mongoose';
 import { StoredFile } from './schemas/file.schema';
 import { MinioService } from '../minio/minio.service';
 import { PdfTextExtractor } from '../parsing/pdf-text-extractor.service';
 import { TextChunker } from '../parsing/text-chunker.service';
 import { DocumentStatus } from './schemas/file.schema';
 import { Chunk } from './schemas/chunk.schema';
+import { Folder } from '../folders/schemas/folder.schema';
 
 type UserCtx = { userId: string; roles?: string[] };
 
@@ -15,33 +16,68 @@ export class FilesService {
     constructor(
         @InjectModel(StoredFile.name) private readonly fileModel: Model<StoredFile>,
         @InjectModel(Chunk.name) private readonly chunkModel: Model<Chunk>,
+        @InjectModel(Folder.name) private readonly folderModel: Model<Folder>,
         private readonly minio: MinioService,
         private readonly extractor: PdfTextExtractor,
         private readonly chunker: TextChunker,
     ) { }
 
-    // --- helper pro práva ---
-    private isAdmin(user?: UserCtx) {
-        return !!user?.roles?.includes('ADMIN');
-    }
+    private isAdmin(user?: UserCtx) { return !!user?.roles?.includes('ADMIN'); }
     private ensureOwnerOrAdmin(ownerId: string | undefined | null, user: UserCtx) {
         if (ownerId && ownerId.toString() === user.userId) return;
         if (this.isAdmin(user)) return;
         throw new ForbiddenException('Not allowed');
     }
 
+    // NEW: kontrola vlastnictví složky
+    private async assertFolderOwned(folderId: string, user: UserCtx) {
+        const ok = await this.folderModel.exists({ _id: folderId, ownerId: user.userId });
+        if (!ok) throw new BadRequestException('Folder not found or not owned by user');
+    }
+
     // --- CRUD nad StoredFile ---
     async create(meta: {
         originalName: string; key: string; bucket: string; mime: string; size: number;
-        uploaderId?: string; tags?: string[];
+        uploaderId: string; tags?: string[]; folderId: string;
     }) {
-        return this.fileModel.create(meta);
+        await this.assertFolderOwned(meta.folderId, { userId: meta.uploaderId });
+        return this.fileModel.create({
+            ...meta,
+            folderId: new Types.ObjectId(meta.folderId),
+        });
     }
 
     async findAllForUser(user: UserCtx, filter: FilterQuery<StoredFile> = {}, limit = 50, skip = 0) {
-        const f = { ...filter };
-        if (!this.isAdmin(user)) (f as any).uploaderId = user.userId;
-        return this.fileModel.find(f).sort({ createdAt: -1 }).skip(skip).limit(limit).lean();
+        const f: any = { ...filter };
+
+        if (f.folderId && typeof f.folderId === 'string') {
+            try { f.folderId = new Types.ObjectId(f.folderId); } catch { }
+        }
+
+        if (!this.isAdmin(user)) f.uploaderId = user.userId;
+
+        const rows = await this.fileModel
+            .find(f)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .lean();
+
+        return rows.map((r: any) => ({
+            id: r._id?.toString?.() ?? r._id,
+            originalName: r.originalName,
+            key: r.key,
+            bucket: r.bucket,
+            mime: r.mime,
+            size: r.size,
+            uploaderId: r.uploaderId,
+            folderId: r.folderId?.toString?.() ?? r.folderId,
+            tags: r.tags ?? [],
+            status: r.status,
+            pageCount: r.pageCount,
+            createdAt: r.createdAt,
+            updatedAt: r.updatedAt,
+        }));
     }
 
     async findByIdForUser(id: string, user: UserCtx) {
@@ -62,11 +98,22 @@ export class FilesService {
         this.ensureOwnerOrAdmin(doc.uploaderId, user);
         await this.minio.removeObject(doc.key);
         await doc.deleteOne();
-        await this.chunkModel.deleteMany({ documentId: id }); // uklidit chunky
+        await this.chunkModel.deleteMany({ documentId: id });
         return { ok: true };
     }
 
-    // --- Chunking & přístup k chunkům ---
+    // NEW: přesun do jiné složky
+    async moveToFolderForUser(id: string, folderId: string, user: UserCtx) {
+        await this.assertFolderOwned(folderId, user);
+        const doc = await this.fileModel.findById(id);
+        if (!doc) throw new NotFoundException('File not found');
+        this.ensureOwnerOrAdmin(doc.uploaderId, user);
+        doc.folderId = new Types.ObjectId(folderId);
+        await doc.save();
+        return { ok: true };
+    }
+
+    // --- Chunky ---
     async listChunksForUser(documentId: string, user: UserCtx) {
         const doc = await this.fileModel.findById(documentId).lean();
         if (!doc) throw new NotFoundException('File not found');
