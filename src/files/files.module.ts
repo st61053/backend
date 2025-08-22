@@ -9,6 +9,10 @@ import { PdfTextExtractor } from '../parsing/pdf-text-extractor.service';
 import { TextChunker } from '../parsing/text-chunker.service';
 import { Folder, FolderSchema } from '../folders/schemas/folder.schema';
 import { FoldersModule } from '../folders/folders.module';
+import { DocxTextExtractor } from 'src/parsing/docx-text-extractor.service';
+import { PlainTextExtractor } from 'src/parsing/plain-text-extractor.service';
+import { PptxTextExtractor } from 'src/parsing/pptx-text-extractor.service';
+import { UniversalTextExtractor } from 'src/parsing/universal-text-extractor.service';
 
 @Module({
     imports: [
@@ -21,7 +25,15 @@ import { FoldersModule } from '../folders/folders.module';
         ]),
     ],
     controllers: [FilesController],
-    providers: [FilesService, PdfTextExtractor, TextChunker],
+    providers: [
+        FilesService,
+        PdfTextExtractor,
+        DocxTextExtractor,
+        PptxTextExtractor,
+        PlainTextExtractor,
+        UniversalTextExtractor,
+        TextChunker
+    ],
     exports: [FilesService],
 })
 export class FilesModule { }

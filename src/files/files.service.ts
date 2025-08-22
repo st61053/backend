@@ -8,6 +8,7 @@ import { TextChunker } from '../parsing/text-chunker.service';
 import { DocumentStatus } from './schemas/file.schema';
 import { Chunk } from './schemas/chunk.schema';
 import { Folder } from '../folders/schemas/folder.schema';
+import { UniversalTextExtractor } from 'src/parsing/universal-text-extractor.service';
 
 type UserCtx = { userId: string; roles?: string[] };
 
@@ -18,7 +19,7 @@ export class FilesService {
         @InjectModel(Chunk.name) private readonly chunkModel: Model<Chunk>,
         @InjectModel(Folder.name) private readonly folderModel: Model<Folder>,
         private readonly minio: MinioService,
-        private readonly extractor: PdfTextExtractor,
+        private readonly extractor: UniversalTextExtractor,
         private readonly chunker: TextChunker,
     ) { }
 
@@ -128,9 +129,13 @@ export class FilesService {
 
         try {
             const buf = await this.minio.getObjectBuffer(doc.key);
-            const pages = await this.extractor.extractPerPage(buf);
-            const prepared = this.chunker.split(doc.id, pages, size, overlap);
 
+            const pages = await this.extractor.extractPerPage(buf, {
+                mime: doc.mime,
+                filename: doc.originalName,
+            });
+
+            const prepared = this.chunker.split(doc.id, pages, size, overlap);
             await this.chunkModel.deleteMany({ documentId: doc.id });
             await this.chunkModel.insertMany(prepared);
 

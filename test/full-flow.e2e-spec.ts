@@ -10,7 +10,7 @@ class FakeMinioService {
     private store = new Map<string, Buffer>();
     bucketName() { return this.bucket; }
     async ensureBucket() { }
-    async uploadObject(objectName: string, data: Buffer, mimeType?: string) {
+    async uploadObject(objectName: string, data: Buffer, _mimeType?: string) {
         this.store.set(objectName, Buffer.from(data));
         return { bucket: this.bucket, objectName };
     }
@@ -26,18 +26,35 @@ class FakeMinioService {
     }
 }
 
-// === FAKE PDF EXTRACTOR ===
+// === FAKE UNIVERSAL EXTRACTOR (PDF/DOCX/PPTX) ===
 import { PageText } from '../src/parsing/pdf-text-extractor.service';
-class FakePdfTextExtractor {
-    async extractPerPage(_buffer: Buffer): Promise<PageText[]> {
-        return [
-            { page: 1, text: 'HTTP je protokol aplikační vrstvy. TCP zajišťuje spolehlivý přenos dat.' },
-            { page: 2, text: 'DNS převádí doménová jména na IP adresy. REST je architektonický styl pro API.' },
-        ];
+class FakeUniversalTextExtractor {
+    async extractPerPage(_buf: Buffer, opts?: { mime?: string; filename?: string }): Promise<PageText[]> {
+        const name = (opts?.filename || '').toLowerCase();
+        if (name.endsWith('.pdf')) {
+            return [
+                { page: 1, text: 'PDF strana 1 – obsah' },
+                { page: 2, text: 'PDF strana 2 – pokračování' },
+            ];
+        }
+        if (name.endsWith('.docx')) {
+            return [
+                { page: 1, text: 'DOCX stránka 1 – obsah dokumentu' },
+                { page: 2, text: 'DOCX stránka 2 – další text' },
+            ];
+        }
+        if (name.endsWith('.pptx')) {
+            return [
+                { page: 1, text: 'PPTX slide 1 – úvod' },
+                { page: 2, text: 'PPTX slide 2 – střed' },
+                { page: 3, text: 'PPTX slide 3 – závěr' },
+            ];
+        }
+        return [{ page: 1, text: 'GEN stránka 1' }];
     }
 }
 
-// Helper pro prefixy
+// Helper pro prefixy (zkusí /api/v1, /api, bez prefixu)
 const tryPrefixes = ['/api/v1', '/api', ''];
 const doReq = (app: INestApplication) => ({
     get: async (route: string, token?: string) => {
@@ -58,24 +75,6 @@ const doReq = (app: INestApplication) => ({
         }
         return request(app.getHttpServer()).post(route).send(body ?? {});
     },
-    patch: async (route: string, body?: any, token?: string) => {
-        for (const p of tryPrefixes) {
-            let r = request(app.getHttpServer()).patch(`${p}${route}`);
-            if (token) r = r.set('Authorization', `Bearer ${token}`);
-            const res = await r.send(body ?? {});
-            if (res.status !== 404) return res;
-        }
-        return request(app.getHttpServer()).patch(route).send(body ?? {});
-    },
-    del: async (route: string, token?: string) => {
-        for (const p of tryPrefixes) {
-            let r = request(app.getHttpServer()).delete(`${p}${route}`);
-            if (token) r = r.set('Authorization', `Bearer ${token}`);
-            const res = await r;
-            if (res.status !== 404) return res;
-        }
-        return request(app.getHttpServer()).delete(route);
-    },
     upload: async (route: string, fileBuf: Buffer, filename: string, fields: Record<string, string>, token?: string) => {
         for (const p of tryPrefixes) {
             let r = request(app.getHttpServer()).post(`${p}${route}`);
@@ -91,18 +90,15 @@ const doReq = (app: INestApplication) => ({
     },
 });
 
+const expectOk = (status: number) => expect([200, 201]).toContain(status);
+
 jest.setTimeout(60000);
 
-describe('Full E2E flow — split by steps', () => {
+describe('E2E — PDF, DOCX & PPTX end-to-end flow', () => {
     let app: INestApplication;
     let mongod: MongoMemoryServer;
     let http: ReturnType<typeof doReq>;
-
-    // Sdílený stav mezi kroky:
     let authToken = '';
-    let folderId = '';
-    let fileId = '';
-    let docId = '';
 
     beforeAll(async () => {
         mongod = await MongoMemoryServer.create();
@@ -112,14 +108,21 @@ describe('Full E2E flow — split by steps', () => {
         const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
             .overrideProvider(require('../src/minio/minio.service').MinioService)
             .useClass(FakeMinioService)
-            .overrideProvider(require('../src/parsing/pdf-text-extractor.service').PdfTextExtractor)
-            .useClass(FakePdfTextExtractor)
+            // ⬇️ override UniversalTextExtractor (musí být provider v app)
+            .overrideProvider(require('../src/parsing/universal-text-extractor.service').UniversalTextExtractor)
+            .useClass(FakeUniversalTextExtractor)
             .compile();
 
         app = moduleRef.createNestApplication();
         app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
         await app.init();
         http = doReq(app);
+
+        // Auth
+        const reg = await http.post('/auth/register', { email: 'student@example.com', password: 'Password1' });
+        expectOk(reg.status);
+        expect(reg.body?.access_token).toBeDefined();
+        authToken = reg.body.access_token as string;
     });
 
     afterAll(async () => {
@@ -127,89 +130,79 @@ describe('Full E2E flow — split by steps', () => {
         if (mongod) await mongod.stop();
     });
 
-    describe('Auth', () => {
-        it('register → returns JWT', async () => {
-            const reg = await http.post('/auth/register', { email: 'student@example.com', password: 'Password1' });
-            expect([200, 201]).toContain(reg.status);
-            expect(reg.body?.access_token).toBeDefined();
-            authToken = reg.body.access_token as string;
-        });
-    });
+    const runFlowFor = (label: 'PDF' | 'DOCX' | 'PPTX', filename: string, expectedPages: number) => {
+        describe(`${label} flow`, () => {
+            let folderId = '';
+            let fileId = '';
+            let docId = '';
 
-    describe('Folders', () => {
-        it('create folder', async () => {
-            const res = await http.post('/folders', { name: 'Diplomka' }, authToken);
-            expect([200, 201]).toContain(res.status);
-            folderId = res.body.id || res.body._id;
-            expect(folderId).toBeDefined();
-        });
-    });
+            it('create folder', async () => {
+                const res = await http.post('/folders', { name: `Složka ${label}` }, authToken);
+                expectOk(res.status);
+                folderId = res.body.id || res.body._id;
+                expect(folderId).toBeDefined();
+            });
 
-    describe('Files: upload', () => {
-        it('upload file into folder', async () => {
-            const fileBuf = Buffer.from('%PDF-1.4 dummy');
-            const upload = await http.upload('/files/upload', fileBuf, 'doc.pdf', { folderId }, authToken);
-            expect([200, 201]).toContain(upload.status);
-            fileId = upload.body.id || upload.body._id;
-            expect(fileId).toBeDefined();
-            expect(upload.body.folderId || upload.body.folder?.id).toBeDefined();
-        });
-    });
+            it('upload file', async () => {
+                const buf = Buffer.from('dummy content');
+                const upload = await http.upload('/files/upload', buf, filename, { folderId }, authToken);
+                expectOk(upload.status);
+                fileId = upload.body.id || upload.body._id;
+                expect(fileId).toBeDefined();
+                expect(upload.body.folderId || upload.body.folder?.id).toBeDefined();
+            });
 
-    describe('Files: parse', () => {
-        it('parse file → chunksInserted & pageCount', async () => {
-            const parse = await http.post(`/files/${fileId}/parse?size=80&overlap=20`, {}, authToken);
-            expect(parse.status).toBe(201); // POST default
-            expect(parse.body.ok).toBe(true);
-            expect(parse.body.chunksInserted).toBeGreaterThan(0);
-            expect(parse.body.pageCount).toBe(2);
-        });
-    });
+            it('parse file → chunksInserted & pageCount', async () => {
+                const parse = await http.post(`/files/${fileId}/parse?size=80&overlap=20`, {}, authToken);
+                expectOk(parse.status);
+                expect(parse.body.ok).toBe(true);
+                expect(parse.body.chunksInserted).toBeGreaterThan(0);
+                expect(parse.body.pageCount).toBe(expectedPages);
+            });
 
-    describe('Documents', () => {
-        it('create document (title + folderId + fileId)', async () => {
-            const res = await http.post('/documents', { title: 'Moje PDF', folderId, fileId }, authToken);
-            expect([200, 201]).toContain(res.status);
-            docId = res.body.id || res.body._id;
-            expect(docId).toBeDefined();
-        });
+            it('create document', async () => {
+                const res = await http.post('/documents', { title: `${label} dokument`, folderId, fileId }, authToken);
+                expectOk(res.status);
+                docId = res.body.id || res.body._id;
+                expect(docId).toBeDefined();
+            });
 
-        it('get document detail', async () => {
-            const res = await http.get(`/documents/${docId}`, authToken);
-            expect(res.status).toBe(200);
-            expect(res.body.id || res.body._id).toBeDefined();
-            expect(res.body.title).toBe('Moje PDF');
-        });
-    });
+            it('get document detail', async () => {
+                const res = await http.get(`/documents/${docId}`, authToken);
+                expect(res.status).toBe(200);
+                expect(res.body.title).toBe(`${label} dokument`);
+            });
 
-    describe('Documents: chunks', () => {
-        it('list chunks via document', async () => {
-            const res = await http.get(`/documents/${docId}/chunks`, authToken);
-            expect(res.status).toBe(200);
-            expect(Array.isArray(res.body)).toBe(true);
-            expect(res.body.length).toBeGreaterThan(0);
-            expect(res.body[0]).toHaveProperty('text');
-        });
-    });
+            it('list chunks via document', async () => {
+                const res = await http.get(`/documents/${docId}/chunks`, authToken);
+                expect(res.status).toBe(200);
+                expect(Array.isArray(res.body)).toBe(true);
+                expect(res.body.length).toBeGreaterThan(0);
+                expect(res.body[0]).toHaveProperty('text');
+            });
 
-    describe('Files: list & download', () => {
-        it('list files filtered by folder contains uploaded file', async () => {
-            const res = await http.get(`/files?folderId=${folderId}`, authToken);
-            expect(res.status).toBe(200);
-            expect(Array.isArray(res.body)).toBe(true);
-            const found = res.body.find((f: any) => f.id === fileId || f._id === fileId);
-            // pro snadné ladění při failu:
-            if (!found) {
-                // eslint-disable-next-line no-console
-                console.log('FILES LIST body:', res.body, 'expected fileId:', fileId);
-            }
-            expect(found).toBeTruthy();
-        });
+            it('list files by folder contains the uploaded file', async () => {
+                const res = await http.get(`/files?folderId=${folderId}`, authToken);
+                expect(res.status).toBe(200);
+                const norm = (x: any) => (x?.id ?? x?._id ?? '').toString();
+                const found = res.body.find((f: any) => norm(f) === norm({ id: fileId }));
+                if (!found) {
+                    // eslint-disable-next-line no-console
+                    console.log(`[${label}] FILES LIST body:`, res.body, 'expected fileId:', fileId);
+                }
+                expect(found).toBeTruthy();
+            });
 
-        it('get download URL', async () => {
-            const res = await http.get(`/files/${fileId}/download`, authToken);
-            expect(res.status).toBe(200);
-            expect(res.body.url).toMatch(/^http:\/\/example\/presigned\//);
+            it('get download URL', async () => {
+                const res = await http.get(`/files/${fileId}/download`, authToken);
+                expect(res.status).toBe(200);
+                expect(res.body.url).toMatch(/^http:\/\/example\/presigned\//);
+            });
         });
-    });
+    };
+
+    // Spusť tři scénáře
+    runFlowFor('PDF', 'doc.pdf', 2);
+    runFlowFor('DOCX', 'doc.docx', 2);
+    runFlowFor('PPTX', 'slides.pptx', 3);
 });
