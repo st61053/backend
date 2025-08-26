@@ -10,6 +10,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { AuthModule } from './auth/auth.module';
 import { FoldersModule } from './folders/folders.module';
 import { DocumentsModule } from './documents/documents.module';
+import { TestsModule } from './tests/tests.module';
 
 @Module({
   imports: [
@@ -31,6 +32,7 @@ import { DocumentsModule } from './documents/documents.module';
     FilesModule,
     DocumentsModule,
     TerminusModule,
+    TestsModule,
     HealthModule,
   ],
 })
