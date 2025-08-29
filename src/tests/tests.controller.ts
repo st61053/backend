@@ -1,5 +1,5 @@
 import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiBody, ApiQuery, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiBody, ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { TestsService } from './tests.service';
@@ -16,14 +16,35 @@ export class TestsController {
 
     // ===== Generování pro složku =====
     @Post('folders/:folderId/tests/generate')
-    @ApiBody({ type: GenerateFolderTestsDto })
+    @ApiOperation({ summary: 'Vygeneruje testy ve složce' })
+    @ApiBody({
+        type: GenerateFolderTestsDto,
+        examples: {
+            AiSample: {
+                summary: 'AI strategie – malý balíček',
+                value: {
+                    topicCount: 4,
+                    finalCount: 6,
+                    archiveExisting: true,
+                    strategy: 'ai',
+                    mix: { mcq: 5, tf: 2, msq: 2, cloze: 1 },
+                },
+            }
+        },
+    })
     async generateForFolder(
         @Param('folderId') folderId: string,
         @Body() dto: GenerateFolderTestsDto,
         @CurrentUser() user: { userId: string },
     ) {
         return this.tests.generateForFolder(
-            folderId, user, dto.topicCount ?? 5, dto.finalCount ?? 20, dto.archiveExisting ?? true,
+            folderId,
+            user,
+            dto.topicCount ?? 5,
+            dto.finalCount ?? 20,
+            dto.archiveExisting ?? true,
+            dto.strategy ?? 'fake',
+            dto.mix,
         );
     }
 
@@ -59,8 +80,12 @@ export class TestsController {
 
     @Patch('attempts/:id/answers')
     @ApiBody({ type: UpdateAnswersDto })
-    async updateAnswers(@Param('id') id: string, @Body() dto: UpdateAnswersDto, @CurrentUser() user: { userId: string }) {
-        return this.tests.updateAnswers(id, user, dto.answers);
+    async updateAnswers(
+        @Param('id') id: string,
+        @Body() dto: UpdateAnswersDto,
+        @CurrentUser() user: { userId: string },
+    ) {
+        return this.tests.updateAnswers(id, user, dto);
     }
 
     @Post('attempts/:id/submit')

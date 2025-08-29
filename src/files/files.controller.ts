@@ -3,7 +3,7 @@ import {
     BadRequestException, UseGuards, Patch
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { ApiTags, ApiConsumes, ApiBody, ApiQuery, ApiBearerAuth } from '@nestjs/swagger';
+import { ApiTags, ApiConsumes, ApiBody, ApiQuery, ApiBearerAuth, ApiOkResponse, ApiOperation } from '@nestjs/swagger';
 import { randomUUID } from 'crypto';
 
 import { FilesService } from './files.service';
@@ -11,6 +11,7 @@ import { MinioService } from '../minio/minio.service';
 import { CreateFileDto } from './dto/create-file.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
+import { FileResponseDto } from './schemas/file.schema';
 
 class MoveFileDto { folderId!: string; }
 
@@ -22,10 +23,67 @@ export class FilesController {
     constructor(private readonly files: FilesService, private readonly minio: MinioService) { }
 
     @Get()
-    @ApiQuery({ name: 'q', required: false, description: 'fulltext v názvu (simple contains)' })
-    @ApiQuery({ name: 'folderId', required: false, description: 'filtr na složku' }) // NEW
-    @ApiQuery({ name: 'limit', required: false, schema: { type: 'number', default: 50 } })
-    @ApiQuery({ name: 'skip', required: false, schema: { type: 'number', default: 0 } })
+    @ApiOperation({ summary: 'Seznam souborů uživatele (fulltext + filtr na složku, stránkování)' })
+    @ApiQuery({
+        name: 'q',
+        required: false,
+        description: 'Fulltext v názvu (case-insensitive contains)',
+        schema: { type: 'string' },
+        examples: {
+            containsPdf: { summary: 'Hledat PDF', value: 'pdf' },
+            containsInvoice: { summary: 'Hledat faktury', value: 'invoice' },
+        },
+    })
+    @ApiQuery({
+        name: 'folderId',
+        required: false,
+        description: 'Filtrovat podle ID složky',
+        schema: { type: 'string' },
+        examples: {
+            someFolder: { summary: 'Konkrétní složka', value: '66cf19ee2e3a4b5c6d7e8f8f' },
+        },
+    })
+    @ApiQuery({ name: 'limit', required: false, schema: { type: 'number', default: 50, minimum: 1, maximum: 200 } })
+    @ApiQuery({ name: 'skip', required: false, schema: { type: 'number', default: 0, minimum: 0 } })
+    @ApiOkResponse({
+        description: 'Pole souborů',
+        type: FileResponseDto,
+        isArray: true,
+        schema: {
+            example: [
+                {
+                    id: '66cf1a1f2e3a4b5c6d7e8f90',
+                    originalName: 'invoice-2025-08-01.pdf',
+                    key: '2025-08-29/6a2d9e3c-0a7b-4b8e-af1d-1a2b3c4d5e6f.pdf',
+                    bucket: 'documents',
+                    mime: 'application/pdf',
+                    size: 482391,
+                    uploaderId: 'user_123',
+                    folderId: '66cf19ee2e3a4b5c6d7e8f8f',
+                    tags: ['invoice', '2025', 'finance'],
+                    status: 'UPLOADED',
+                    pageCount: 12,
+                    createdAt: '2025-08-29T18:04:12.345Z',
+                    updatedAt: '2025-08-29T18:04:12.345Z',
+                },
+                {
+                    id: '66cf1a202e3a4b5c6d7e8f91',
+                    originalName: 'scan-contrat-2025.png',
+                    key: '2025-08-29/7b3e0a9b-1b2c-4c8e-8f2e-e1f0a2b3c4d5.png',
+                    bucket: 'documents',
+                    mime: 'image/png',
+                    size: 238112,
+                    uploaderId: 'user_123',
+                    folderId: '66cf19ee2e3a4b5c6d7e8f8f',
+                    tags: ['contract'],
+                    status: 'PARSED',
+                    pageCount: null,
+                    createdAt: '2025-08-28T10:11:12.000Z',
+                    updatedAt: '2025-08-28T10:11:12.000Z',
+                },
+            ],
+        },
+    })
     async list(
         @Query('q') q: string | undefined,
         @Query('folderId') folderId: string | undefined,
@@ -36,7 +94,25 @@ export class FilesController {
         const filter: any = {};
         if (q) filter.originalName = { $regex: q, $options: 'i' };
         if (folderId) filter.folderId = folderId;
-        return await this.files.findAllForUser(user, filter, Number(limit), Number(skip));
+
+        const rows = await this.files.findAllForUser(user, filter, Number(limit), Number(skip));
+
+        // pokud vracíš Mongoose dokumenty, přemapuj na DTO:
+        return rows.map((r: any) => ({
+            id: r._id?.toString?.() ?? r.id,
+            originalName: r.originalName,
+            key: r.key,
+            bucket: r.bucket,
+            mime: r.mime,
+            size: r.size,
+            uploaderId: r.uploaderId,
+            folderId: r.folderId?.toString?.() ?? r.folderId,
+            tags: r.tags ?? [],
+            status: r.status,
+            pageCount: r.pageCount ?? null,
+            createdAt: r.createdAt?.toISOString?.() ?? r.createdAt,
+            updatedAt: r.updatedAt?.toISOString?.() ?? r.updatedAt,
+        }));
     }
 
     @Get(':id')

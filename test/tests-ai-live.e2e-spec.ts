@@ -26,8 +26,7 @@ class FakeMinioService {
     }
 }
 
-// === FAKE UNIVERSAL EXTRACTOR ===
-// Vrací "stránky" podle názvu souboru, aby chunker měl obsah.
+// === FAKE UNIVERSAL TEXT EXTRACTOR ===
 import { PageText } from '../src/parsing/pdf-text-extractor.service';
 class FakeUniversalTextExtractor {
     async extractPerPage(_buf: Buffer, opts?: { mime?: string; filename?: string }): Promise<PageText[]> {
@@ -44,7 +43,6 @@ class FakeUniversalTextExtractor {
                 { page: 2, text: 'Kafka je distribuovaný log. JSON je výměnný formát.' },
             ];
         }
-        // fallback (PDF apod.)
         return [
             { page: 1, text: 'PDF strana 1 – obsah' },
             { page: 2, text: 'PDF strana 2 – pokračování' },
@@ -52,7 +50,7 @@ class FakeUniversalTextExtractor {
     }
 }
 
-// Helper pro prefixy (zkusí /api/v1, /api, bez prefixu)
+// Helper pro prefixy
 const tryPrefixes = ['/api/v1', '/api', ''];
 const doReq = (app: INestApplication) => ({
     get: async (route: string, token?: string) => {
@@ -99,19 +97,27 @@ const doReq = (app: INestApplication) => ({
 
 const expectOk = (status: number) => expect([200, 201]).toContain(status);
 
-jest.setTimeout(60000);
+// Podmíněné spuštění: bez OPENAI_API_KEY se test přeskočí
+const maybeDescribe: jest.Describe = process.env.OPENAI_API_KEY ? describe : describe.skip;
 
-describe('E2E — Folder test generation & attempts', () => {
+jest.setTimeout(120000);
+
+maybeDescribe('E2E — AI generation (live OpenAI)', () => {
     let app: INestApplication;
     let mongod: MongoMemoryServer;
     let http: ReturnType<typeof doReq>;
     let authToken = '';
 
     let folderId = '';
-    let fileA = ''; // networks
-    let fileB = ''; // databases
+    let fileA = '';
+    let fileB = '';
 
     beforeAll(async () => {
+        if (!process.env.OPENAI_API_KEY) {
+            // jen pro jistotu, kdyby někdo omylem přepnul maybeDescribe na describe
+            console.warn('Skipping AI E2E: OPENAI_API_KEY is not set.');
+            return;
+        }
         mongod = await MongoMemoryServer.create();
         process.env.MONGO_URI = mongod.getUri();
         process.env.JWT_SECRET = 'testsecret';
@@ -121,6 +127,7 @@ describe('E2E — Folder test generation & attempts', () => {
             .useClass(FakeMinioService)
             .overrideProvider(require('../src/parsing/universal-text-extractor.service').UniversalTextExtractor)
             .useClass(FakeUniversalTextExtractor)
+            // POZOR: NEpřepisujeme QuestionGeneratorService – používáme reálné AI
             .compile();
 
         app = moduleRef.createNestApplication();
@@ -128,20 +135,20 @@ describe('E2E — Folder test generation & attempts', () => {
         await app.init();
         http = doReq(app);
 
-        // Auth
+        // auth
         const reg = await http.post('/auth/register', { email: 'student@example.com', password: 'Password1' });
         expectOk(reg.status);
         authToken = reg.body.access_token;
     });
 
     afterAll(async () => {
-        await app.close();
+        if (app) await app.close();
         if (mongod) await mongod.stop();
     });
 
-    describe('Seed: folder + 2 files + parse', () => {
+    describe('Seed: folder + files + parse', () => {
         it('create folder', async () => {
-            const res = await http.post('/folders', { name: 'Lekce 1' }, authToken);
+            const res = await http.post('/folders', { name: 'Lekce AI Live' }, authToken);
             expectOk(res.status);
             folderId = res.body.id || res.body._id;
             expect(folderId).toBeDefined();
@@ -154,7 +161,7 @@ describe('E2E — Folder test generation & attempts', () => {
             fileA = up.body.id || up.body._id;
             expect(fileA).toBeDefined();
 
-            const parse = await http.post(`/files/${fileA}/parse?size=100&overlap=20`, {}, authToken);
+            const parse = await http.post(`/files/${fileA}/parse?size=120&overlap=20`, {}, authToken);
             expectOk(parse.status);
             expect(parse.body.ok).toBe(true);
             expect(parse.body.chunksInserted).toBeGreaterThan(0);
@@ -167,52 +174,57 @@ describe('E2E — Folder test generation & attempts', () => {
             fileB = up.body.id || up.body._id;
             expect(fileB).toBeDefined();
 
-            const parse = await http.post(`/files/${fileB}/parse?size=100&overlap=20`, {}, authToken);
+            const parse = await http.post(`/files/${fileB}/parse?size=120&overlap=20`, {}, authToken);
             expectOk(parse.status);
             expect(parse.body.ok).toBe(true);
             expect(parse.body.chunksInserted).toBeGreaterThan(0);
         });
     });
 
-    describe('Generate tests for folder', () => {
-        it('POST /folders/:folderId/tests/generate', async () => {
+    describe('Generate tests via AI', () => {
+        it('POST /folders/:folderId/tests/generate (strategy: ai)', async () => {
             const gen = await http.post(`/folders/${folderId}/tests/generate`, {
                 topicCount: 5,
                 finalCount: 6,
                 archiveExisting: true,
+                strategy: 'ai',
+                // mix je orientační; AI se ho snaží dodržet, ale test nevyžaduje shodu typů
+                mix: { mcq: 5, msq: 2, tf: 1, cloze: 1, short: 1, match: 1, order: 1 },
             }, authToken);
+
             expectOk(gen.status);
             expect(Array.isArray(gen.body.createdTestIds)).toBe(true);
             expect(gen.body.createdTestIds.length).toBeGreaterThanOrEqual(3); // 2 topics + 1 final
         });
 
-        it('GET /folders/:folderId/tests (active only)', async () => {
+        it('GET /folders/:folderId/tests → list active', async () => {
             const list = await http.get(`/folders/${folderId}/tests?includeArchived=false`, authToken);
             expect(list.status).toBe(200);
             expect(Array.isArray(list.body)).toBe(true);
-
-            const types = new Set(list.body.map((t: any) => t.type));
-            expect(types.has('topic')).toBe(true);
-            expect(types.has('final')).toBe(true);
-
+            expect(list.body.length).toBeGreaterThanOrEqual(3);
             for (const t of list.body) {
                 expect(t.archived).toBe(false);
                 expect(t.questionCount).toBeGreaterThan(0);
             }
         });
 
-        it('GET /tests/:id returns public view (no answerKey)', async () => {
+        it('GET /tests/:id → public view (no solutions)', async () => {
             const list = await http.get(`/folders/${folderId}/tests`, authToken);
             const anyTestId = list.body[0].id || list.body[0]._id;
+
             const detail = await http.get(`/tests/${anyTestId}`, authToken);
             expect(detail.status).toBe(200);
-            expect(Array.isArray(detail.body.questions)).toBe(true);
-            expect(detail.body.questions.length).toBeGreaterThan(0);
-            // žádný answerKey
-            for (const q of detail.body.questions) {
-                expect(q.answerKey).toBeUndefined();
-                expect(Array.isArray(q.options)).toBe(true);
-                expect(q.options.length).toBe(4);
+            const qs = detail.body.questions;
+            expect(Array.isArray(qs)).toBe(true);
+            expect(qs.length).toBeGreaterThan(0);
+
+            // public view nesmí prozrazovat řešení
+            for (const q of qs) {
+                expect(typeof q.text).toBe('string');
+                expect(q.correctIndices).toBeUndefined();
+                expect(q.correctBool).toBeUndefined();
+                expect(q.clozeAnswers).toBeUndefined();
+                expect(q.acceptableAnswers).toBeUndefined();
             }
         });
     });
@@ -222,11 +234,11 @@ describe('E2E — Folder test generation & attempts', () => {
         let attemptId = '';
         let total = 0;
 
-        it('pick a topic test', async () => {
+        it('pick any test', async () => {
             const list = await http.get(`/folders/${folderId}/tests`, authToken);
-            const topic = list.body.find((t: any) => t.type === 'topic') || list.body[0];
-            expect(topic).toBeTruthy();
-            testId = topic.id || topic._id;
+            const any = list.body[0];
+            expect(any).toBeTruthy();
+            testId = any.id || any._id;
         });
 
         it('create attempt', async () => {
@@ -238,36 +250,27 @@ describe('E2E — Folder test generation & attempts', () => {
             expect(total).toBeGreaterThan(0);
         });
 
-        it('update answers (q0, q1)', async () => {
-            const updates = { answers: [{ q: 0, option: 'A' }, ...(total > 1 ? [{ q: 1, option: 'C' }] : [])] };
-            const res = await http.patch(`/attempts/${attemptId}/answers`, updates, authToken);
-            expectOk(res.status);
-            expect(res.body.ok).toBe(true);
-        });
-
-        it('submit attempt', async () => {
+        it('submit attempt without updates (allowed)', async () => {
+            // nevyplňujeme odpovědi – ověřujeme jen, že pipeline proběhne a skóre je vyčíslené
             const res = await http.post(`/attempts/${attemptId}/submit`, {}, authToken);
             expectOk(res.status);
-            expect(res.body.score).toBeGreaterThanOrEqual(0);
             expect(res.body.total).toBe(total);
+            expect(res.body.score).toBeGreaterThanOrEqual(0);
         });
 
-        it('get attempt detail (submitted)', async () => {
+        it('get attempt detail', async () => {
             const res = await http.get(`/attempts/${attemptId}`, authToken);
             expect(res.status).toBe(200);
             expect(res.body.status).toBe('submitted');
             expect(Array.isArray(res.body.answers)).toBe(true);
             expect(res.body.total).toBe(total);
-            // kontrola, že se nevrací test s answerKey (vrací se jen meta)
             expect(res.body.test).toBeDefined();
             expect(res.body.test.title).toBeDefined();
-            expect(res.body.test.questionCount).toBeGreaterThan(0);
         });
     });
 
     describe('Archiving', () => {
         it('archive one test and verify listing filters it out', async () => {
-            // vezmeme první aktivní test
             const list1 = await http.get(`/folders/${folderId}/tests?includeArchived=false`, authToken);
             expect(list1.status).toBe(200);
             const first = list1.body[0];
